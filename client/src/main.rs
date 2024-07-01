@@ -1,50 +1,55 @@
-use std::net::SocketAddr;
 use tokio::net::UdpSocket;
-use tokio::io::{self, BufReader};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use std::sync::Arc;
+use tokio::time::{Duration, interval};
+
+const DISCONNECT_MESSAGE: &str = "!DISCONNECT";
+const HEARTBEAT_MESSAGE: &str = "!HEARTBEAT";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let server_addr = "127.0.0.1:8080".parse::<SocketAddr>()?;
-        
-    let stdin = io::stdin();
-    
-    let mut reader = BufReader::new(stdin);
-    
-    let mut buf = String::from("CONNECTING");
-    socket.send_to(buf.as_bytes(), &server_addr).await?;
-    buf.clear();
-    let mut buf2 = vec![0u8; 1024];
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    socket.connect("127.0.0.1:8080").await?;
 
-    loop {
-        tokio::select! {
-            n = reader.read_line(&mut buf) => {
-                match n {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        socket.send_to(buf.as_bytes(), &server_addr).await?;
-                    },
-                    Err(e) => return Err(e.into()),
-                }
-                buf.clear();
-            },
+    println!("Connected to server. Start typing messages (type '!DISCONNECT' to quit):");
 
-            res = socket.recv_from(&mut buf2) => {
-                let (n, _addr) = match res {
-                    Ok((n, _addr)) => (n, _addr),
-                    Err(e) => {
-                        eprintln!("Error receiving message: {:?}", e);
-                        continue;
-                    }
-                };
-                if let Ok(msg) = std::str::from_utf8(&buf2[..n]) {
-                    print!("- {}", msg);
+    let socket_clone = Arc::clone(&socket);
+    let receive_handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 1024];
+        loop {
+            match socket_clone.recv(&mut buf).await {
+                Ok(len) => {
+                    let message = String::from_utf8_lossy(&buf[..len]);
+                        println!("{}", message);
                 }
-                buf.clear();
-            },
+                Err(e) => eprintln!("Failed to receive message: {}", e),
+            }
         }
+    });
+
+    let socket_clone = Arc::clone(&socket);
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = interval(HEARTBEAT_INTERVAL);
+        loop {
+            interval.tick().await;
+            let _ = socket_clone.send(HEARTBEAT_MESSAGE.as_bytes()).await;
+        }
+    });
+
+    let mut stdin: tokio::io::Lines<BufReader<tokio::io::Stdin>> = BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = stdin.next_line().await? {
+        if line == DISCONNECT_MESSAGE {
+            socket.send(DISCONNECT_MESSAGE.as_bytes()).await?;
+            break;
+        }
+        socket.send(line.as_bytes()).await?;
     }
+
+    // Clean up
+    receive_handle.abort();
+    heartbeat_handle.abort();
+    println!("Disconnected from server.");
 
     Ok(())
 }
